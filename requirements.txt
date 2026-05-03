@@ -1,6 +1,7 @@
 ﻿fastapi==0.122.0
 uvicorn==0.38.0
 onnxruntime==1.25.1
+onnx==1.21.0
 numpy==2.3.5
 pydantic==2.12.5
 pytest==9.0.3
