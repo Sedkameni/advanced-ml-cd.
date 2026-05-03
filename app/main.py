@@ -4,6 +4,7 @@ FastAPI application with async support for concurrent request handling.
 """
 
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -25,6 +26,10 @@ logger = logging.getLogger(__name__)
 model_session: Optional[ort.InferenceSession] = None
 tokenizer_vocab: Optional[dict] = None
 
+# Base directory (resolved relative to this file)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODEL_PATH = os.path.join(BASE_DIR, "model", "sentiment_model.onnx")
+
 # -------------------------------------------------------------------
 # Simple whitespace tokenizer + vocab (mirrors lab activity approach)
 # -------------------------------------------------------------------
@@ -40,7 +45,7 @@ def build_simple_vocab():
     negative_words = [
         "bad", "terrible", "awful", "horrible", "worst", "hate", "disgusting",
         "poor", "disappointing", "dreadful", "negative", "pathetic", "lousy",
-        "miserable", "atrocious", "dreadful", "unpleasant",
+        "miserable", "atrocious", "unpleasant",
     ]
     neutral_words = [
         "the", "a", "an", "is", "was", "are", "were", "it", "this", "that",
@@ -57,7 +62,6 @@ def tokenize(text: str, vocab: dict, max_length: int = 128) -> List[int]:
     tokens = text.lower().split()
     unk_id = vocab.get("[UNK]", 1)
     ids = [vocab.get(tok, unk_id) for tok in tokens]
-    # Truncate / pad to max_length
     ids = ids[:max_length]
     ids += [vocab.get("[PAD]", 0)] * (max_length - len(ids))
     return ids
@@ -69,17 +73,14 @@ def create_dummy_onnx_model():
         import onnx
         from onnx import helper, TensorProto
 
-        # Input: token ids  [batch, seq]
         input_ids = helper.make_tensor_value_info("input_ids", TensorProto.INT64, [None, 128])
-        # Output: logits [batch, 2]
         output = helper.make_tensor_value_info("logits", TensorProto.FLOAT, [None, 2])
 
-        # Simple embedding: cast ids to float and pool
         cast_node = helper.make_node("Cast", inputs=["input_ids"], outputs=["cast_out"],
                                      to=TensorProto.FLOAT)
         mean_node = helper.make_node("ReduceMean", inputs=["cast_out"], outputs=["mean_out"],
                                      axes=[1])
-        # Linear projection 128 -> 2
+
         weight_data = np.random.randn(128, 2).astype(np.float32) * 0.01
         bias_data = np.array([0.1, -0.1], dtype=np.float32)
 
@@ -100,8 +101,11 @@ def create_dummy_onnx_model():
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 7
-        onnx.save(model, "/app/model/sentiment_model.onnx")
-        logger.info("Dummy ONNX model created successfully.")
+
+        # Use relative path instead of hardcoded /app
+        os.makedirs(os.path.join(BASE_DIR, "model"), exist_ok=True)
+        onnx.save(model, MODEL_PATH)
+        logger.info("Dummy ONNX model created successfully at %s.", MODEL_PATH)
         return True
     except Exception as exc:
         logger.error("Could not create dummy ONNX model: %s", exc)
@@ -115,31 +119,22 @@ def create_dummy_onnx_model():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model_session, tokenizer_vocab
-
-    logger.info("Loading ONNX model...")
-    model_path = "/app/model/sentiment_model.onnx"
-
-    import os
-    if not os.path.exists(model_path):
-        logger.warning("Model file not found at %s. Creating dummy model.", model_path)
-        os.makedirs("/app/model", exist_ok=True)
+    logger.info("Loading ONNX model from %s...", MODEL_PATH)
+    if not os.path.exists(MODEL_PATH):
+        logger.warning("Model file not found at %s. Creating dummy model.", MODEL_PATH)
         create_dummy_onnx_model()
-
     try:
         sess_options = ort.SessionOptions()
         sess_options.inter_op_num_threads = 4
         sess_options.intra_op_num_threads = 4
-        model_session = ort.InferenceSession(model_path, sess_options=sess_options)
+        model_session = ort.InferenceSession(MODEL_PATH, sess_options=sess_options)
         logger.info("ONNX model loaded. Inputs: %s", [i.name for i in model_session.get_inputs()])
     except Exception as exc:
         logger.error("Failed to load ONNX model: %s", exc)
         model_session = None
-
     tokenizer_vocab = build_simple_vocab()
     logger.info("Tokenizer vocabulary built (%d tokens).", len(tokenizer_vocab))
-
     yield  # Application runs here
-
     logger.info("Shutting down — releasing model resources.")
     model_session = None
 
@@ -196,7 +191,7 @@ class BatchSentimentRequest(BaseModel):
 
 class SentimentResult(BaseModel):
     text: str
-    sentiment: str        # "positive" | "negative"
+    sentiment: str
     confidence: float
     positive_score: float
     negative_score: float
@@ -223,38 +218,30 @@ def softmax(x: np.ndarray) -> np.ndarray:
     return e / e.sum(axis=-1, keepdims=True)
 
 
-
-def run_inference(texts: List[str]) -> List[SentimentResult]:
+def run_inference(texts: List[str]):
     if model_session is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
 
     t0 = time.perf_counter()
 
-    # Tokenise
     input_ids = np.array(
         [tokenize(t, tokenizer_vocab) for t in texts], dtype=np.int64
     )
 
-    # Prepare attention mask (1 = real token, 0 = padding)
     pad_id = tokenizer_vocab.get("[PAD]", 0)
     attention_mask = (input_ids != pad_id).astype(np.int64)
 
-    # Dynamically get model input names
     input_names = [inp.name for inp in model_session.get_inputs()]
 
     inputs = {}
-
     if "input_ids" in input_names:
         inputs["input_ids"] = input_ids
-
     if "attention_mask" in input_names:
         inputs["attention_mask"] = attention_mask
 
-    #  MISSING STEP: run ONNX model
     logits = model_session.run(None, inputs)[0]
 
-    # Post-processing
-    probs = softmax(logits)  # shape (batch, 2)
+    probs = softmax(logits)
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     results = []
@@ -277,6 +264,7 @@ def run_inference(texts: List[str]) -> List[SentimentResult]:
         )
 
     return results, elapsed_ms
+
 
 # -------------------------------------------------------------------
 # Routes
@@ -301,7 +289,7 @@ async def root():
 async def predict(request: SentimentRequest, req: Request):
     """Analyse the sentiment of a single text."""
     logger.info("Single inference request from %s", req.client.host if req.client else "unknown")
-    results, elapsed = run_inference([request.text])
+    results, _ = run_inference([request.text])
     return results[0]
 
 
