@@ -31,7 +31,7 @@ def client():
         yield c
 
 
-@pytest_asyncio.fixture(scope="module")
+@pytest_asyncio.fixture(scope="function")  # changed from "module" — avoids event loop conflicts
 async def async_client():
     """Async test client (used for concurrency / stress tests)."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -83,7 +83,7 @@ class TestPredictFunctional:
         resp = client.post("/predict", json={"text": text})
         assert resp.status_code == 200
         data = resp.json()
-        assert data["sentiment"] in ("positive", "negative")  # model may vary
+        assert data["sentiment"] in ("positive", "negative")
         assert 0.0 <= data["confidence"] <= 1.0
 
     @pytest.mark.parametrize("text", NEGATIVE_TEXTS)
@@ -181,7 +181,6 @@ class TestInvalidInputs:
 
     def test_text_field_is_number(self, client):
         resp = client.post("/predict", json={"text": 42})
-        # FastAPI coerces int to str — should succeed
         assert resp.status_code in (200, 422)
 
     def test_null_text(self, client):
@@ -195,7 +194,6 @@ class TestInvalidInputs:
     def test_sql_injection_string(self, client):
         malicious = "'; DROP TABLE sentiments; --"
         resp = client.post("/predict", json={"text": malicious})
-        # Should handle gracefully (200 or 422, never 500)
         assert resp.status_code in (200, 422)
 
     def test_xss_payload(self, client):
@@ -213,7 +211,8 @@ class TestInvalidInputs:
         assert resp.status_code in (200, 422)
 
     def test_wrong_content_type(self, client):
-        resp = client.post("/predict", content="plain text", headers={"Content-Type": "text/plain"})
+        resp = client.post("/predict", content="plain text",
+                           headers={"Content-Type": "text/plain"})
         assert resp.status_code == 422
 
     def test_unknown_extra_fields_ignored(self, client):
